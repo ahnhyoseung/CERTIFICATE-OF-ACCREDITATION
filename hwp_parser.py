@@ -97,7 +97,7 @@ def _run_hwp5proc_xml(hwp_path: str) -> str:
 def _cell_text(cell_elem: ET.Element) -> str:
     """<TableCell> 하위의 모든 <Text> 노드를 문서 순서대로 이어붙여 원문 복원."""
     parts = [t.text or "" for t in cell_elem.iter("Text")]
-    text = " ".join(parts)
+    text = "".join(parts)
     # hwp 원문에 있는 불필요한 공백/개행 정리 (내용 자체는 보존)
     text = re.sub(r"[ \t]+", " ", text)
     text = text.strip()
@@ -134,22 +134,48 @@ def parse_hwp_tables(hwp_path: str) -> List[HwpTable]:
     return tables
 
 
+def _looks_like_data_table(t: "HwpTable") -> bool:
+    """헤더에 우리가 찾는 컬럼 키워드가 하나라도 있으면 '데이터 표'로 간주.
+
+    KOLAS 인정신청분야 문서는 대분류/중분류별로 페이지가 나뉘어 있어,
+    같은 헤더(순번/제품 및 물질/규격번호/규격명/...)를 가진 표가
+    여러 개(문서마다 다르지만 보통 5~15개) 반복해서 나온다. 표 하나만
+    고르면 나머지 표에 있는 규격번호가 전부 "한글에 없음"으로 잘못
+    잡히므로, 헤더가 맞는 표는 전부 모아서 합쳐야 한다.
+    """
+    header_norm = "".join(t.headers).replace(" ", "")
+    return any(
+        any(kw.replace(" ", "") in header_norm for kw in keywords)
+        for keywords in HEADER_KEYWORDS.values()
+    )
+
+
 def parse_hwp_main_table(hwp_path: str, table_index: Optional[int] = None) -> List[Dict[str, str]]:
     """
-    가장 일반적인 사용법: hwp 파일에서 표 하나를 골라 표준화된 레코드로 반환.
+    가장 일반적인 사용법: hwp 파일에서 표를 찾아 표준화된 레코드로 반환.
 
-    table_index 를 지정하지 않으면 "행 수가 가장 많은 표"를 자동 선택한다.
+    table_index 를 지정하면 그 표 하나만 사용한다.
+    지정하지 않으면, 우리가 찾는 컬럼(규격번호/규격명 등) 헤더를 가진
+    표를 "전부" 찾아서 하나로 합친다. (KOLAS 인정신청분야 문서처럼
+    대분류별로 표가 여러 개로 나뉘어 있는 경우, 표 하나만 골랐을 때
+    나머지 표의 항목이 통째로 누락되는 문제를 방지하기 위함)
     """
     tables = parse_hwp_tables(hwp_path)
     if not tables:
         raise RuntimeError(f"{hwp_path} 안에서 표를 찾지 못했습니다.")
 
     if table_index is not None:
-        chosen = tables[table_index]
+        chosen_tables = [tables[table_index]]
     else:
-        chosen = max(tables, key=lambda t: len(t.rows))
+        chosen_tables = [t for t in tables if _looks_like_data_table(t)]
+        if not chosen_tables:
+            # 헤더 키워드로 하나도 못 찾으면 기존 방식(가장 큰 표)으로 폴백
+            chosen_tables = [max(tables, key=lambda t: len(t.rows))]
 
-    return chosen.to_records()
+    records: List[Dict[str, str]] = []
+    for t in chosen_tables:
+        records.extend(t.to_records())
+    return records
 
 
 if __name__ == "__main__":

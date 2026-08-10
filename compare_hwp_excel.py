@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
+import html
 import os
 import re
 import sys
@@ -105,18 +107,44 @@ def normalize(text: object) -> str:
     if text is None:
         return ""
     s = str(text)
+    # 눈에 안 보이는 폭 없는 문자들 제거 (정규식 \s 로 안 잡히는 문자들이라
+    # 별도로 없애줘야 함. 한/엑셀 복사 과정에서 섞여 들어오는 경우가 잦음)
+    invisible_chars = (
+        "\u200b"  # zero-width space
+        "\u200c"  # zero-width non-joiner
+        "\u200d"  # zero-width joiner
+        "\ufeff"  # zero-width no-break space (BOM)
+        "\u00ad"  # soft hyphen
+    )
+    for ch in invisible_chars:
+        s = s.replace(ch, "")
     s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     s = re.sub(r"\s+", " ", s)
     # 전각/반각, 유사 기호 통일 (예: 물결표, 콜론 앞뒤 공백 등)
     s = s.replace("：", ":").replace("～", "~")
+    # 괄호/슬래시 바로 안쪽의 불필요한 공백 제거 (예: "( IEC ...)" vs "(IEC ...)",
+    # "㎍ /L" vs "㎍/L") -> 내용은 같은데 공백 차이만으로 오탐(❌) 나는 것을 방지
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"\s+/", "/", s)
+    s = re.sub(r"/\s+", "/", s)
     s = s.strip()
     return s
 
 
 def normalize_spec_no(text: object) -> str:
-    """규격번호/규격코드는 공백을 아예 없애고 대문자로 통일해서 매칭 키로 사용."""
+    """규격번호/규격코드는 공백을 아예 없애고 대문자로 통일해서 매칭 키로 사용.
+
+    하이픈처럼 생긴 여러 유니코드 문자(en-dash, em-dash, 전각 하이픈,
+    minus sign 등)와 일반 하이픈(-)을 같은 문자로 통일해서, 규격번호에
+    쓰인 하이픈 종류가 문서마다 달라도 매칭 키가 어긋나지 않도록 한다.
+    """
     s = normalize(text)
     s = s.upper().replace(" ", "")
+    # 하이픈처럼 보이는 다양한 문자를 일반 하이픈(-)으로 통일
+    hyphen_like = "\u2010\u2011\u2012\u2013\u2014\u2015\uFF0D\u2212"
+    for ch in hyphen_like:
+        s = s.replace(ch, "-")
     return s
 
 
@@ -294,10 +322,156 @@ def refine_with_claude(results: List[RowResult]) -> None:
 # --------------------------------------------------------------------------
 # 6. 리포트 출력
 # --------------------------------------------------------------------------
-def write_reports(results: List[RowResult], out_dir: str) -> Tuple[str, str]:
+def _safe_path_if_locked(path: str) -> str:
+    """
+    대상 파일이 다른 프로그램(엑셀 등)에서 열려 있어 쓰기 권한이 없는 경우,
+    타임스탬프를 붙인 다른 파일명을 대신 반환한다. (PermissionError 방지)
+    """
+    if not os.path.exists(path):
+        return path
+    try:
+        # 실제로 쓰기 가능한지 열어서 확인 (내용은 바꾸지 않음)
+        with open(path, "a"):
+            pass
+        return path
+    except PermissionError:
+        import datetime
+        base, ext = os.path.splitext(path)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt_path = f"{base}_{ts}{ext}"
+        print(
+            f"[경고] '{path}' 파일이 다른 프로그램(엑셀 등)에서 열려 있어 "
+            f"'{alt_path}' 이름으로 대신 저장합니다. (원래 파일을 닫고 다시 실행하면 "
+            f"동일한 파일명으로 저장할 수 있습니다.)",
+            file=sys.stderr,
+        )
+        return alt_path
+
+
+def _esc(text: str) -> str:
+    """HTML escape 후 줄바꿈은 <br>로 변환 (표 안에서 줄바꿈이 보이도록)."""
+    return html.escape(text).replace("\n", "<br>")
+
+
+def highlight_diff_html(a: str, b: str) -> Tuple[str, str]:
+    """
+    두 문자열(a=한글 기준, b=엑셀)을 글자 단위로 비교해서, 서로 다른
+    부분만 색으로 강조한 HTML 조각을 반환한다.
+    - a(한글)쪽: 엑셀에는 없고 한글에만 있는 부분 -> 빨간 취소선
+    - b(엑셀)쪽: 한글에는 없고 엑셀에만 있는 부분 -> 초록 배경
+    같은 부분은 그대로 표시.
+    """
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    out_a: List[str] = []
+    out_b: List[str] = []
+    DEL = 'style="background-color:#ffd6d6;color:#b30000;text-decoration:line-through;"'
+    INS = 'style="background-color:#d6ffd6;color:#006600;"'
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        seg_a, seg_b = _esc(a[i1:i2]), _esc(b[j1:j2])
+        if tag == "equal":
+            out_a.append(seg_a)
+            out_b.append(seg_b)
+        elif tag == "delete":
+            out_a.append(f"<span {DEL}>{seg_a}</span>")
+        elif tag == "insert":
+            out_b.append(f"<span {INS}>{seg_b}</span>")
+        elif tag == "replace":
+            out_a.append(f"<span {DEL}>{seg_a}</span>")
+            out_b.append(f"<span {INS}>{seg_b}</span>")
+    return "".join(out_a), "".join(out_b)
+
+
+def write_html_report(results: List[RowResult], out_dir: str) -> str:
+    """색상으로 차이를 강조한 HTML 리포트 생성 (브라우저에서 열어서 확인)."""
+    html_path = _safe_path_if_locked(os.path.join(out_dir, "diff_report.html"))
+
+    matched = [r for r in results if r.status == "matched"]
+    mismatched = [r for r in matched if r.has_mismatch]
+    hwp_only = [r for r in results if r.status == "hwp_only"]
+    excel_only = [r for r in results if r.status == "excel_only"]
+
+    parts: List[str] = []
+    parts.append("<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>")
+    parts.append("<title>한글(HWP) vs 엑셀 비교 리포트</title>")
+    parts.append(
+        "<style>"
+        "body{font-family:'Malgun Gothic',sans-serif;margin:24px;line-height:1.5;}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:24px;table-layout:fixed;}"
+        "th,td{border:1px solid #ccc;padding:8px;vertical-align:top;word-break:break-word;}"
+        "th{background:#f0f0f0;text-align:left;}"
+        "td.field{white-space:nowrap;width:160px;font-weight:bold;background:#fafafa;}"
+        "td.mark{width:60px;text-align:center;}"
+        "h2{border-bottom:2px solid #333;padding-bottom:4px;margin-top:40px;}"
+        "h3{background:#eef;padding:6px 10px;border-left:4px solid #557;}"
+        "ul{line-height:1.8;}"
+        "</style></head><body>"
+    )
+    parts.append("<h1>한글(HWP) vs 엑셀 비교 리포트</h1>")
+    parts.append("<ul>")
+    parts.append(f"<li>매칭된 규격번호 수: {len(matched)}</li>")
+    parts.append(f"<li>내용이 다른 규격번호 수: {len(mismatched)}</li>")
+    parts.append(f"<li>한글에만 있는 규격번호 수(엑셀 누락): {len(hwp_only)}</li>")
+    parts.append(f"<li>엑셀에만 있는 규격번호 수(한글에 없음): {len(excel_only)}</li>")
+    parts.append("</ul>")
+
+    if mismatched:
+        parts.append("<h2>내용 불일치 상세</h2>")
+        for r in mismatched:
+            spec_no = html.escape(r.hwp_record.get("spec_no", ""))
+            parts.append(f"<h3>규격번호: {spec_no}</h3>")
+            parts.append(
+                "<table><tr><th>항목</th><th>한글(기준)</th><th>엑셀</th><th>일치여부</th></tr>"
+            )
+            for d in r.field_diffs:
+                mark = "✅" if d.same else "❌"
+                if d.same:
+                    a_html, b_html = _esc(d.hwp_value), _esc(d.excel_value)
+                else:
+                    # 실제 판정 로직과 동일하게 정규화(공백/줄바꿈 정리)한 값끼리
+                    # 비교해서 강조 표시 -> 서식 차이 노이즈 없이 진짜 차이만 색으로 표시
+                    norm_field = "spec_no" if d.field == "규격번호/규격코드" else None
+                    if norm_field == "spec_no":
+                        norm_a, norm_b = normalize_spec_no(d.hwp_value), normalize_spec_no(d.excel_value)
+                    else:
+                        norm_a, norm_b = normalize(d.hwp_value), normalize(d.excel_value)
+                    a_html, b_html = highlight_diff_html(norm_a, norm_b)
+                field = html.escape(d.field)
+                parts.append(
+                    f"<tr><td class='field'>{field}</td>"
+                    f"<td>{a_html}</td><td>{b_html}</td>"
+                    f"<td class='mark'>{mark}</td></tr>"
+                )
+            parts.append("</table>")
+
+    if hwp_only:
+        parts.append("<h2>한글에는 있는데 엑셀에 없는 규격번호</h2><ul>")
+        for r in hwp_only:
+            spec_no = html.escape(r.hwp_record.get("spec_no", ""))
+            spec_name = html.escape(r.hwp_record.get("spec_name", ""))
+            parts.append(f"<li>{spec_no} : {spec_name}</li>")
+        parts.append("</ul>")
+
+    if excel_only:
+        parts.append(
+            "<h2>엑셀에는 있는데 한글에 없는 규격번호 "
+            "(한글 문서에 해당 대/중분류가 없을 수도 있음)</h2><ul>"
+        )
+        for r in excel_only:
+            parts.append(f"<li>{html.escape(r.spec_no_key)}</li>")
+        parts.append("</ul>")
+
+    parts.append("</body></html>")
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write("".join(parts))
+
+    return html_path
+
+
+def write_reports(results: List[RowResult], out_dir: str) -> Tuple[str, str, str]:
     os.makedirs(out_dir, exist_ok=True)
-    md_path = os.path.join(out_dir, "diff_report.md")
-    csv_path = os.path.join(out_dir, "diff_report.csv")
+    md_path = _safe_path_if_locked(os.path.join(out_dir, "diff_report.md"))
+    csv_path = _safe_path_if_locked(os.path.join(out_dir, "diff_report.csv"))
 
     matched = [r for r in results if r.status == "matched"]
     mismatched = [r for r in matched if r.has_mismatch]
@@ -351,7 +525,9 @@ def write_reports(results: List[RowResult], out_dir: str) -> Tuple[str, str]:
             else:
                 writer.writerow([r.spec_no_key, "한글없음", "", "", "", ""])
 
-    return md_path, csv_path
+    html_path = write_html_report(results, out_dir)
+
+    return md_path, csv_path, html_path
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +556,7 @@ def write_synced_excel(xls_path: str, results: List[RowResult], col_map: Dict[st
             df.at[r.excel_row_index, excel_col] = d.hwp_value
             changed_cells.append((r.excel_row_index, excel_col))
 
-    out_path = os.path.join(out_dir, "synced.xlsx")
+    out_path = _safe_path_if_locked(os.path.join(out_dir, "synced.xlsx"))
     df.to_excel(out_path, index=False)
 
     # 변경된 셀 노란색 강조 + 폰트 통일
@@ -481,9 +657,10 @@ def main():
         refine_with_claude(results)
 
     print("[4/5] 리포트 작성 중...")
-    md_path, csv_path = write_reports(results, args.out_dir)
+    md_path, csv_path, html_path = write_reports(results, args.out_dir)
     print(f"      -> {md_path}")
     print(f"      -> {csv_path}")
+    print(f"      -> {html_path}  (색상으로 차이 강조, 브라우저로 열어보세요)")
 
     print("[5/5] 엑셀 동일화(synced.xlsx) 작성 중...")
     synced_path = write_synced_excel(xls_path, results, col_map, args.out_dir)
