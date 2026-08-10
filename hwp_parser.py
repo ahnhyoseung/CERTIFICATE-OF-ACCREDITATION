@@ -97,7 +97,7 @@ def _run_hwp5proc_xml(hwp_path: str) -> str:
 def _cell_text(cell_elem: ET.Element) -> str:
     """<TableCell> 하위의 모든 <Text> 노드를 문서 순서대로 이어붙여 원문 복원."""
     parts = [t.text or "" for t in cell_elem.iter("Text")]
-    text = "".join(parts)
+    text = " ".join(parts)
     # hwp 원문에 있는 불필요한 공백/개행 정리 (내용 자체는 보존)
     text = re.sub(r"[ \t]+", " ", text)
     text = text.strip()
