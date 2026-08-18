@@ -18,6 +18,26 @@ compare_hwp_excel.py
 값이 다르면 "내용 불일치"로, 규격번호 자체가 한쪽에만 있으면
 "누락/추가"로 분류합니다.
 
+[2026-08 수정 1] 소재지(사업장) 매칭 버그 수정
+--------------------------------------------
+기존 location_same()이 정규화된 소재지 코드끼리 "포함관계(in)"까지
+동일한 것으로 판정하고 있었습니다. 그런데 실제 데이터에는 "소재지"
+(번호 없음)와 "소재지-1", "소재지-2" ... 처럼 서로 다른 독립된 값이
+공존하기 때문에, 문자열 "소재지"가 "소재지-2"의 부분 문자열이 되어
+전혀 다른 사업장(예: 진주 vs 안산)이 같은 곳으로 오판정되는 문제가
+있었습니다. 이번 수정으로 소재지 코드는 완전일치(==)만 허용합니다.
+
+[2026-08 수정 2] 동일 엑셀 행 중복 매칭 버그 수정  ← 이번에 추가로 발견/수정
+--------------------------------------------------
+compare() 의 "1차(정확 키) 매칭" 경로에서 이미 다른 HWP 레코드가
+사용한 엑셀 행(used_excel_indices)을 걸러내지 않고 있었습니다.
+그 결과 (규격번호+소재지) 조합이 HWP 쪽에 두 번 이상 등장하면
+(페이지 분할 표 등으로 동일 항목이 중복 추출되는 경우), 서로 다른
+HWP 레코드 여러 개가 엑셀의 같은 행 하나에 중복으로 매칭되고,
+엑셀에 실제로 존재하는 나머지 행은 "엑셀에만 있음(한글 없음)"으로
+잘못 표시되는 문제가 있었습니다. 이번 수정으로 1차 매칭에서도
+이미 사용된 엑셀 행은 후보에서 제외합니다.
+
 사용법
 ------
     python compare_hwp_excel.py \
@@ -28,6 +48,7 @@ compare_hwp_excel.py
 결과물 (out-dir 안에 생성):
     - diff_report.md         : 사람이 읽기 좋은 비교 리포트 (Markdown)
     - diff_report.csv        : 같은 내용을 엑셀에서 열어볼 수 있는 CSV
+    - diff_report.html       : 색상으로 차이를 강조한 HTML 리포트
     - synced.xlsx             : 한글 내용대로 값이 보정된 엑셀 (변경 셀 노란색 강조)
 
 Claude API를 활용한 유사도 판정 (선택 사항)
@@ -56,7 +77,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from hwp_parser import parse_hwp_main_table
+from hwp_parser import parse_hwp_main_table, parse_hwp_all_tables
 
 
 # --------------------------------------------------------------------------
@@ -70,6 +91,11 @@ EXCEL_HEADER_KEYWORDS = {
     "component": ["구성요소", "특성"],
 }
 
+# 소재지(사업장)는 파일마다 "사업장", "사업장구분", "소재지" 등으로 헤더명이
+# 다를 수 있고, 없는 파일도 있을 수 있어서 필수 컬럼과 분리해서 관리한다.
+# (이 목록에 있는 키워드 중 하나라도 포함되면 매칭)
+LOCATION_HEADER_KEYWORDS = ["사업장", "소재지"]
+
 # 비교 결과 각 필드에 대응하는, synced.xlsx 에 실제로 값을 써넣을 엑셀 컬럼 후보
 # (엑셀 헤더 자동탐색 실패 시 이 이름으로 폴백)
 FALLBACK_EXCEL_COLS = {
@@ -78,6 +104,7 @@ FALLBACK_EXCEL_COLS = {
     "spec_name": "규격명",
     "component": "구성요소,특성(시험범위)(한글)",
 }
+FALLBACK_LOCATION_COL = "사업장구분"
 
 
 def find_excel_columns(columns: List[str]) -> Dict[str, Optional[str]]:
@@ -97,6 +124,20 @@ def find_excel_columns(columns: List[str]) -> Dict[str, Optional[str]]:
     for k, v in col_map.items():
         if v is None and FALLBACK_EXCEL_COLS[k] in columns:
             col_map[k] = FALLBACK_EXCEL_COLS[k]
+
+    # 소재지(사업장) 컬럼은 선택 사항 -> 못 찾아도 에러 내지 않고 None으로 둠
+    location_col: Optional[str] = None
+    for col in columns:
+        col_str = str(col)
+        norm = col_str.replace(" ", "")
+        if "영문" in norm:
+            continue
+        if any(kw in norm for kw in LOCATION_HEADER_KEYWORDS):
+            location_col = col_str
+            break
+    if location_col is None and FALLBACK_LOCATION_COL in columns:
+        location_col = FALLBACK_LOCATION_COL
+    col_map["location"] = location_col
     return col_map
 
 
@@ -107,17 +148,6 @@ def normalize(text: object) -> str:
     if text is None:
         return ""
     s = str(text)
-    # 눈에 안 보이는 폭 없는 문자들 제거 (정규식 \s 로 안 잡히는 문자들이라
-    # 별도로 없애줘야 함. 한/엑셀 복사 과정에서 섞여 들어오는 경우가 잦음)
-    invisible_chars = (
-        "\u200b"  # zero-width space
-        "\u200c"  # zero-width non-joiner
-        "\u200d"  # zero-width joiner
-        "\ufeff"  # zero-width no-break space (BOM)
-        "\u00ad"  # soft hyphen
-    )
-    for ch in invisible_chars:
-        s = s.replace(ch, "")
     s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     s = re.sub(r"\s+", " ", s)
     # 전각/반각, 유사 기호 통일 (예: 물결표, 콜론 앞뒤 공백 등)
@@ -128,24 +158,68 @@ def normalize(text: object) -> str:
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"\s+/", "/", s)
     s = re.sub(r"/\s+", "/", s)
+    # 콜론 앞뒤 공백 표기 통일 (예: "Test Load :" vs "Test Load:")
+    s = re.sub(r"\s*:\s*", ": ", s)
+    # "제 1부" vs "제1부", "제 2-2 부" vs "제2-2부" 처럼 "제"와 숫자(하이픈 포함)
+    # 사이, 숫자와 "부/절/항/편" 사이의 공백 표기 차이를 통일
+    s = re.sub(r"제\s+([\d\-\.]+)", r"제\1", s)          # "제 " -> "제"
+    s = re.sub(r"([\d\-\.]+)\s+(부|절|항|편)", r"\1\2", s)  # "N.N 절" -> "N.N절"
+    # 하이픈 계열(엔대시/엠대시) 표기 통일
+    s = s.replace("–", "-").replace("—", "-")
     s = s.strip()
     return s
 
 
 def normalize_spec_no(text: object) -> str:
-    """규격번호/규격코드는 공백을 아예 없애고 대문자로 통일해서 매칭 키로 사용.
-
-    하이픈처럼 생긴 여러 유니코드 문자(en-dash, em-dash, 전각 하이픈,
-    minus sign 등)와 일반 하이픈(-)을 같은 문자로 통일해서, 규격번호에
-    쓰인 하이픈 종류가 문서마다 달라도 매칭 키가 어긋나지 않도록 한다.
-    """
+    """규격번호/규격코드는 공백을 아예 없애고 대문자로 통일해서 매칭 키로 사용."""
     s = normalize(text)
     s = s.upper().replace(" ", "")
-    # 하이픈처럼 보이는 다양한 문자를 일반 하이픈(-)으로 통일
-    hyphen_like = "\u2010\u2011\u2012\u2013\u2014\u2015\uFF0D\u2212"
-    for ch in hyphen_like:
-        s = s.replace(ch, "-")
     return s
+
+
+def normalize_location(text: object) -> str:
+    """
+    소재지/사업장 비교용 정규화.
+
+    한글(HWP) 소제목은 "소재지-1, 구로"처럼 [코드 + 지역명]이 함께 있지만,
+    엑셀 "사업장" 컬럼은 실무상 "소재지-1"처럼 [코드]만 들어있는 경우가
+    대부분이라, 뒤에 붙는 지역명은 버리고 앞의 코드 부분만 뽑아 비교 키로
+    쓴다. (코드 패턴을 못 찾으면 전체 텍스트를 공백 제거해서 그대로 사용)
+
+    주의: "소재지"(번호 없음)와 "소재지-1", "소재지-2" ... 는 실제로는
+    서로 다른, 독립된 사업장 코드다. \\d* 로 인해 "소재지"만 있어도
+    매치되지만, 반환되는 코드 자체는 "소재지"와 "소재지-N"으로 서로
+    다르게 나오므로 이후 비교는 반드시 완전일치(==)로 판정해야 한다
+    (location_same 참고).
+    """
+    s = normalize(text)
+    m = re.match(r"^(소재지\s*-?\s*\d*|부속시설\s*-?\s*\d+)", s)
+    if m:
+        code = re.sub(r"\s+", "", m.group(1))
+        # "소재지1" 처럼 하이픈이 빠진 표기도 "소재지-1"로 통일
+        code = re.sub(r"^(소재지|부속시설)(\d)", r"\1-\2", code)
+        return code
+    return s.replace(" ", "")
+
+
+def location_same(hwp_loc: str, excel_loc: str) -> bool:
+    """
+    소재지 코드가 완전히 일치하는지 판정한다.
+
+    [수정] 기존에는 normalize_location() 결과끼리 포함관계(in)까지
+    동일한 것으로 허용했다 (a in b or b in a). 그런데 실제 데이터에는
+    "소재지"(번호 없음)와 "소재지-1" / "소재지-2" ... 가 서로 다른
+    독립된 사업장으로 공존하며, "소재지"라는 문자열이 "소재지-1",
+    "소재지-2" 등의 부분 문자열이 되어 버려 전혀 다른 사업장(예: 진주
+    vs 안산)이 같은 곳으로 오판정되는 문제가 있었다.
+
+    normalize_location()이 이미 코드를 깔끔하게 추출해주므로, 여기서는
+    완전일치만 허용한다.
+    """
+    a, b = normalize_location(hwp_loc), normalize_location(excel_loc)
+    if not a or not b:
+        return False
+    return a == b
 
 
 # --------------------------------------------------------------------------
@@ -180,35 +254,81 @@ def load_excel(xls_path: str) -> Tuple[pd.DataFrame, Dict[str, Optional[str]]]:
     df = pd.read_excel(xls_path, engine=engine, dtype=str)
     df = df.fillna("")
     col_map = find_excel_columns(list(df.columns))
-    missing = [k for k, v in col_map.items() if v is None]
+    # "location"(소재지/사업장)은 선택 항목이라 필수 컬럼 누락 검사에서 제외
+    missing = [k for k, v in col_map.items() if v is None and k != "location"]
     if missing:
         raise RuntimeError(
             f"엑셀에서 다음 컬럼을 찾지 못했습니다: {missing}\n"
             f"실제 컬럼 목록: {list(df.columns)}"
         )
+    if col_map.get("location") is None:
+        print(
+            "[안내] 엑셀에서 소재지/사업장 컬럼을 찾지 못해 소재지 비교는 건너뜁니다.",
+            file=sys.stderr,
+        )
     return df, col_map
 
 
 def compare(hwp_records: List[Dict[str, str]], df: pd.DataFrame, col_map: Dict[str, str]) -> List[RowResult]:
-    # 엑셀: 규격코드 정규화 키 -> 행 index 리스트 (중복 있을 수 있음)
+    location_col = col_map.get("location")
+    # 소재지 매칭을 켤지 여부: 엑셀에 소재지 컬럼이 있고, 한글 쪽 레코드에도
+    # location 정보가 하나라도 채워져 있으면(=parse_hwp_all_tables로 파싱했으면) 사용.
+    use_location = bool(location_col) and any(rec.get("location") for rec in hwp_records)
+
+    def make_key(spec_no_norm: str, location_raw: str) -> str:
+        if use_location:
+            return f"{spec_no_norm}||{normalize_location(location_raw)}"
+        return spec_no_norm
+
+    # 엑셀: 매칭 키 -> 행 index 리스트 (중복 있을 수 있음)
     excel_key_to_indices: Dict[str, List[int]] = {}
     for idx, row in df.iterrows():
-        key = normalize_spec_no(row[col_map["spec_no"]])
+        spec_key = normalize_spec_no(row[col_map["spec_no"]])
+        loc_val = str(row[location_col]) if location_col else ""
+        key = make_key(spec_key, loc_val)
         excel_key_to_indices.setdefault(key, []).append(idx)
 
     results: List[RowResult] = []
     used_excel_indices = set()
 
     for rec in hwp_records:
-        key = normalize_spec_no(rec.get("spec_no", ""))
-        if not key:
+        spec_key = normalize_spec_no(rec.get("spec_no", ""))
+        if not spec_key:
             continue
-        candidates = excel_key_to_indices.get(key, [])
+        hwp_loc = rec.get("location", "")
+        key = make_key(spec_key, hwp_loc)
+
+        # [수정 2] 1차(정확 키) 매칭에서도 이미 다른 HWP 레코드가 사용한
+        # 엑셀 행은 후보에서 제외한다. 이게 빠져 있으면 (규격번호+소재지)가
+        # HWP 쪽에 중복으로 등장할 때 같은 엑셀 행에 여러 번 매칭되고,
+        # 엑셀에 실제로 존재하는 나머지 행이 "엑셀에만 있음"으로 잘못
+        # 표시되는 문제가 생긴다.
+        candidates = [
+            idx for idx in excel_key_to_indices.get(key, [])
+            if idx not in used_excel_indices
+        ]
+        if not candidates and use_location:
+            # 소재지까지 붙여서 못 찾았으면, 소재지 표기 차이(코드 정규식
+            # 추출이 안 되는 비정형 텍스트 등)까지 감안해서 같은 규격번호를
+            # 가진 후보들 중 소재지가 "동일 코드"로 판정되는 것을 한 번 더
+            # 찾아본다. (location_same은 완전일치만 허용하므로, 여기서
+            # "소재지" vs "소재지-2"처럼 서로 다른 사업장이 잘못 엮이지
+            # 않는다)
+            spec_only_candidates = [
+                idx for idx, row in df.iterrows()
+                if normalize_spec_no(row[col_map["spec_no"]]) == spec_key
+                and idx not in used_excel_indices
+            ]
+            candidates = [
+                idx for idx in spec_only_candidates
+                if location_same(hwp_loc, str(df.loc[idx, location_col]))
+            ]
+
         if not candidates:
             results.append(RowResult(spec_no_key=key, status="hwp_only", hwp_record=rec))
             continue
 
-        excel_idx = candidates[0]  # 동일 규격번호가 여러 개면 첫 번째만 사용
+        excel_idx = candidates[0]  # 동일 키가 여러 개면 첫 번째만 사용
         used_excel_indices.add(excel_idx)
         row = df.loc[excel_idx]
 
@@ -239,6 +359,19 @@ def compare(hwp_records: List[Dict[str, str]], df: pd.DataFrame, col_map: Dict[s
             ),
         ]
 
+        if location_col:
+            excel_loc = str(row[location_col])
+            diffs.append(
+                FieldDiff(
+                    field="소재지/사업장",
+                    hwp_value=hwp_loc,
+                    excel_value=excel_loc,
+                    # hwp 쪽에 소재지 정보가 아예 없는 표(주사업장 등)는
+                    # 비교 대상에서 제외하고 "일치"로 처리 (오탐 방지)
+                    same=(not hwp_loc) or location_same(hwp_loc, excel_loc),
+                )
+            )
+
         results.append(
             RowResult(
                 spec_no_key=key,
@@ -253,7 +386,9 @@ def compare(hwp_records: List[Dict[str, str]], df: pd.DataFrame, col_map: Dict[s
     for idx, row in df.iterrows():
         if idx in used_excel_indices:
             continue
-        key = normalize_spec_no(row[col_map["spec_no"]])
+        spec_key = normalize_spec_no(row[col_map["spec_no"]])
+        loc_val = str(row[location_col]) if location_col else ""
+        key = make_key(spec_key, loc_val)
         results.append(RowResult(spec_no_key=key, status="excel_only", excel_row_index=idx))
 
     return results
@@ -418,7 +553,9 @@ def write_html_report(results: List[RowResult], out_dir: str) -> str:
         parts.append("<h2>내용 불일치 상세</h2>")
         for r in mismatched:
             spec_no = html.escape(r.hwp_record.get("spec_no", ""))
-            parts.append(f"<h3>규격번호: {spec_no}</h3>")
+            loc = r.hwp_record.get("location", "")
+            title = spec_no + (f" ({html.escape(loc)})" if loc else "")
+            parts.append(f"<h3>규격번호: {title}</h3>")
             parts.append(
                 "<table><tr><th>항목</th><th>한글(기준)</th><th>엑셀</th><th>일치여부</th></tr>"
             )
@@ -488,7 +625,9 @@ def write_reports(results: List[RowResult], out_dir: str) -> Tuple[str, str, str
         if mismatched:
             f.write("## 내용 불일치 상세\n\n")
             for r in mismatched:
-                f.write(f"### 규격번호: {r.hwp_record.get('spec_no', '')}\n\n")
+                loc = r.hwp_record.get("location", "")
+                title = r.hwp_record.get('spec_no', '') + (f" ({loc})" if loc else "")
+                f.write(f"### 규격번호: {title}\n\n")
                 f.write("| 항목 | 한글(기준) | 엑셀 | 일치여부 |\n")
                 f.write("|---|---|---|---|\n")
                 for d in r.field_diffs:
@@ -549,10 +688,13 @@ def write_synced_excel(xls_path: str, results: List[RowResult], col_map: Dict[st
                 "규격번호/규격코드": "spec_no",
                 "규격명": "spec_name",
                 "구성요소,특성(시험범위)": "component",
+                "소재지/사업장": "location",
             }[d.field]
             if d.same:
                 continue
-            excel_col = col_map[std_name]
+            excel_col = col_map.get(std_name)
+            if not excel_col:
+                continue  # 소재지 컬럼이 엑셀에 없는 경우 등은 건너뜀
             df.at[r.excel_row_index, excel_col] = d.hwp_value
             changed_cells.append((r.excel_row_index, excel_col))
 
@@ -642,8 +784,15 @@ def main():
         )
 
     print(f"[1/5] HWP 파싱 중: {hwp_path}")
-    hwp_records = parse_hwp_main_table(hwp_path)
-    print(f"      -> {len(hwp_records)}개 행 추출")
+    try:
+        # 부속시설별로 표가 여러 개 있으면 전부 합치고, 표 위 "(...)" 제목을
+        # 소재지로 함께 붙여서 반환한다. (소재지 비교/복합키 매칭에 사용)
+        hwp_records = parse_hwp_all_tables(hwp_path)
+    except RuntimeError as e:
+        print(f"      -> 표 자동 인식 실패({e}), 가장 큰 표 하나만 사용합니다.")
+        hwp_records = parse_hwp_main_table(hwp_path)
+    n_with_loc = sum(1 for r in hwp_records if r.get("location"))
+    print(f"      -> {len(hwp_records)}개 행 추출 (소재지 정보 있는 행: {n_with_loc}개)")
 
     print(f"[2/5] 엑셀 로딩 중: {xls_path}")
     df, col_map = load_excel(xls_path)
