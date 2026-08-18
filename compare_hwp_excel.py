@@ -38,6 +38,14 @@ HWP 레코드 여러 개가 엑셀의 같은 행 하나에 중복으로 매칭�
 잘못 표시되는 문제가 있었습니다. 이번 수정으로 1차 매칭에서도
 이미 사용된 엑셀 행은 후보에서 제외합니다.
 
+[2026-08 수정 3] HWP 전용/엑셀 전용 리스트에 소재지 표기 추가
+--------------------------------------------------------------
+"한글에는 있는데 엑셀에 없는 규격번호" / "엑셀에는 있는데 한글에 없는
+규격번호" 목록에 소재지 정보가 빠져 있어, 동일한 규격번호가 사업장별로
+서로 다르게 누락된 경우(예: 진주 사업장만 누락, 안산 사업장은 정상)를
+구분할 수 없었습니다. 이번 수정으로 HTML/마크다운 리포트의 두 목록
+모두에 소재지를 함께 표기합니다.
+
 사용법
 ------
     python compare_hwp_excel.py \
@@ -240,6 +248,8 @@ class RowResult:
     hwp_record: Optional[Dict[str, str]] = None
     excel_row_index: Optional[int] = None  # 엑셀 데이터프레임 상의 행 index
     field_diffs: List[FieldDiff] = field(default_factory=list)
+    excel_location: str = ""  # excel_only 상태일 때 표시용 소재지 원문
+    excel_spec_no_raw: str = ""  # excel_only 상태일 때 표시용 규격코드 원문(정규화 전)
 
     @property
     def has_mismatch(self) -> bool:
@@ -389,7 +399,13 @@ def compare(hwp_records: List[Dict[str, str]], df: pd.DataFrame, col_map: Dict[s
         spec_key = normalize_spec_no(row[col_map["spec_no"]])
         loc_val = str(row[location_col]) if location_col else ""
         key = make_key(spec_key, loc_val)
-        results.append(RowResult(spec_no_key=key, status="excel_only", excel_row_index=idx))
+        results.append(RowResult(
+            spec_no_key=key,
+            status="excel_only",
+            excel_row_index=idx,
+            excel_location=loc_val,
+            excel_spec_no_raw=str(row[col_map["spec_no"]]),
+        ))
 
     return results
 
@@ -539,6 +555,7 @@ def write_html_report(results: List[RowResult], out_dir: str) -> str:
         "h2{border-bottom:2px solid #333;padding-bottom:4px;margin-top:40px;}"
         "h3{background:#eef;padding:6px 10px;border-left:4px solid #557;}"
         "ul{line-height:1.8;}"
+        ".loc{color:#557;font-weight:normal;}"
         "</style></head><body>"
     )
     parts.append("<h1>한글(HWP) vs 엑셀 비교 리포트</h1>")
@@ -585,7 +602,9 @@ def write_html_report(results: List[RowResult], out_dir: str) -> str:
         for r in hwp_only:
             spec_no = html.escape(r.hwp_record.get("spec_no", ""))
             spec_name = html.escape(r.hwp_record.get("spec_name", ""))
-            parts.append(f"<li>{spec_no} : {spec_name}</li>")
+            loc = r.hwp_record.get("location", "")
+            loc_html = f" <span class='loc'>[{html.escape(loc)}]</span>" if loc else ""
+            parts.append(f"<li>{spec_no} : {spec_name}{loc_html}</li>")
         parts.append("</ul>")
 
     if excel_only:
@@ -594,7 +613,10 @@ def write_html_report(results: List[RowResult], out_dir: str) -> str:
             "(한글 문서에 해당 대/중분류가 없을 수도 있음)</h2><ul>"
         )
         for r in excel_only:
-            parts.append(f"<li>{html.escape(r.spec_no_key)}</li>")
+            spec_no_display = r.excel_spec_no_raw or r.spec_no_key
+            loc = r.excel_location
+            loc_html = f" <span class='loc'>[{html.escape(loc)}]</span>" if loc else ""
+            parts.append(f"<li>{html.escape(spec_no_display)}{loc_html}</li>")
         parts.append("</ul>")
 
     parts.append("</body></html>")
@@ -638,13 +660,17 @@ def write_reports(results: List[RowResult], out_dir: str) -> Tuple[str, str, str
         if hwp_only:
             f.write("## 한글에는 있는데 엑셀에 없는 규격번호\n\n")
             for r in hwp_only:
-                f.write(f"- {r.hwp_record.get('spec_no', '')} : {r.hwp_record.get('spec_name', '')}\n")
+                loc = r.hwp_record.get('location', '')
+                loc_str = f" [{loc}]" if loc else ""
+                f.write(f"- {r.hwp_record.get('spec_no', '')} : {r.hwp_record.get('spec_name', '')}{loc_str}\n")
             f.write("\n")
 
         if excel_only:
             f.write("## 엑셀에는 있는데 한글에 없는 규격번호 (한글 문서에 해당 대/중분류가 없을 수도 있음)\n\n")
             for r in excel_only:
-                f.write(f"- {r.spec_no_key}\n")
+                spec_no_display = r.excel_spec_no_raw or r.spec_no_key
+                loc_str = f" [{r.excel_location}]" if r.excel_location else ""
+                f.write(f"- {spec_no_display}{loc_str}\n")
             f.write("\n")
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
